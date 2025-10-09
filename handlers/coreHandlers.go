@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"image"
 	"image/color"
+	"imageProcessorAPI/utilities"
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/disintegration/imaging"
 	"github.com/gofiber/fiber/v2"
@@ -17,6 +20,9 @@ type RotateBody struct {
 }
 
 func Rotate(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
 
 	body := c.FormValue(`metadata`)
 	if body == `` {
@@ -38,6 +44,11 @@ func Rotate(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(500, `Could not open image.`)
 	}
+	mimeType := file.Header.Get("Content-Type")
+
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
+	}
 
 	fileExt := strings.ToLower(filepath.Ext(file.Filename))
 	if fileExt != `png` && fileExt != `jpeg` && fileExt != `jpg` {
@@ -50,28 +61,66 @@ func Rotate(c *fiber.Ctx) error {
 	}
 	defer fileStream.Close()
 
-	var decodedImage image.Image
-	decodedImage, err = imaging.Decode(fileStream)
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(fileStream)
 
-	if err != nil {
-		slog.Error(`Could noe decode filestream in rotate handler. Error: ` + err.Error())
-		return fiber.NewError(500, `Something went wrong.`)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var decodedImage image.Image
+	select {
+	case img := <-imageChan:
+		decodedImage = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	validImageBounds := utilities.CheckImageBounds(&decodedImage)
+
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
 	}
 
 	rotatedImage := imaging.Rotate(decodedImage, float64(*bodyData.Angle), color.White)
 
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
 	writer := c.Response().BodyWriter()
 	if fileExt == `png` {
+		c.Type(`image/png`)
 		err = imaging.Encode(writer, rotatedImage, imaging.PNG)
 	} else {
+		c.Type(`image/jpeg`)
 		err = imaging.Encode(writer, rotatedImage, imaging.JPEG, imaging.JPEGQuality(85))
 	}
 
 	if err != nil {
-		slog.Error(`Could not encode in rotate handler. Error: ` + err.Error())
-		return fiber.NewError(500, `Something went wrong.`)
+		if ctx.Err() != nil{
+			slog.Error(`Encode failed due to context timeout. Error: ` + err.Error());
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`:`Timeout.`});
+		}
 
+		slog.Error(`Could not encode image in rotate handler. Error: ` + err.Error())
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
+
 
 	return nil
 }
@@ -85,6 +134,10 @@ type CropMetaData struct {
 }
 
 func Crop(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
+
 	metadata := c.FormValue(`metadata`)
 	if metadata == `` {
 		return c.Status(400).JSON(fiber.Map{`message`: `Must set bounds to crop image.`})
@@ -124,6 +177,12 @@ func Crop(c *fiber.Ctx) error {
 		return fiber.NewError(500, `Could not open image.`)
 	}
 
+	mimeType := file.Header.Get("Content-Type")
+
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
+	}
+
 	fileExt := strings.ToLower(filepath.Ext(file.Filename))
 	if fileExt != `png` && fileExt != `jpeg` && fileExt != `jpg` {
 		return fiber.NewError(400, `Expected png or jpg image.`)
@@ -135,12 +194,39 @@ func Crop(c *fiber.Ctx) error {
 	}
 	defer fileStream.Close()
 
-	var decodedImage image.Image
-	decodedImage, err = imaging.Decode(fileStream)
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(fileStream)
 
-	if err != nil {
-		slog.Error(`Could not decode image in crop handler. Error: ` + err.Error())
-		return fiber.NewError(500, `Something went wrong.`)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var decodedImage image.Image
+	select {
+	case img := <-imageChan:
+		decodedImage = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	validImageBounds := utilities.CheckImageBounds(&decodedImage)
+
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
 	}
 
 	if !rec.In(decodedImage.Bounds()) {
@@ -149,17 +235,27 @@ func Crop(c *fiber.Ctx) error {
 
 	croppedImage := imaging.Crop(decodedImage, rec)
 
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
 	bodyWriter := c.Response().BodyWriter()
 
 	if fileExt == `png` {
+		c.Type(`image/png`)
 		err = imaging.Encode(bodyWriter, croppedImage, imaging.PNG)
 	} else {
+		c.Type(`image/jpeg`)
 		err = imaging.Encode(bodyWriter, croppedImage, imaging.JPEG, imaging.JPEGQuality(85))
 	}
+if err != nil {
+		if ctx.Err() != nil{
+			slog.Error(`Encode failed due to context timeout. Error: ` + err.Error());
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`:`Timeout.`});
+		}
 
-	if err != nil {
 		slog.Error(`Could not encode image in crop handler. Error: ` + err.Error())
-		return fiber.NewError(500, `Something went wrong.`)
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
 	return nil
@@ -171,6 +267,10 @@ type ResizeMetaData struct {
 }
 
 func Resize(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
+
 	metadata := c.FormValue(`metadata`)
 
 	if metadata == `` {
@@ -194,6 +294,12 @@ func Resize(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
+	mimeType := fileHeader.Header.Get("Content-Type")
+
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
+	}
+
 	extension := strings.ToLower(filepath.Ext(fileHeader.Filename))
 
 	if extension != `png` && extension != `jpeg` && extension != `jpg` {
@@ -207,10 +313,39 @@ func Resize(c *fiber.Ctx) error {
 	}
 	defer fileStream.Close()
 
-	decodedImage, err := imaging.Decode(fileStream)
-	if err != nil {
-		slog.Error(`Could not decode image in resize handler. Error: ` + err.Error())
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(fileStream)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var decodedImage image.Image
+	select {
+	case img := <-imageChan:
+		decodedImage = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	validImageBounds := utilities.CheckImageBounds(&decodedImage)
+
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
 	}
 
 	var resizedImage *image.NRGBA
@@ -227,12 +362,22 @@ func Resize(c *fiber.Ctx) error {
 	writer := c.Request().BodyWriter()
 
 	if extension == `png` {
+		c.Type(`image/png`)
+
 		err = imaging.Encode(writer, resizedImage, imaging.PNG)
 	} else {
+		c.Type(`image/jpeg`)
+
 		err = imaging.Encode(writer, resizedImage, imaging.JPEG, imaging.JPEGQuality(85))
 	}
+
 	if err != nil {
-		slog.Error(`Could node encode image in resize handler. Error: ` + err.Error())
+		if ctx.Err() != nil{
+			slog.Error(`Encode failed due to context timeout. Error: ` + err.Error());
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`:`Timeout.`});
+		}
+
+		slog.Error(`Could not encode image in resize handler. Error: ` + err.Error())
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
@@ -244,6 +389,10 @@ type ChangeFormatMetadata struct {
 }
 
 func ChangeFormat(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
+
 	jsonPayload := c.FormValue(`metadata`)
 	var metadata = ChangeFormatMetadata{}
 	err := json.Unmarshal([]byte(jsonPayload), &metadata)
@@ -268,6 +417,12 @@ func ChangeFormat(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
+	mimeType := fileheader.Header.Get("Content-Type")
+
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
+	}
+
 	extension := strings.ToLower(filepath.Ext(fileheader.Filename))
 	if extension != `png` && extension != `jpeg` || extension != `jpeg` {
 		return c.Status(400).JSON(fiber.Map{`message`: `Invalid file type.`})
@@ -284,21 +439,60 @@ func ChangeFormat(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	image, err := imaging.Decode(file)
-	if err != nil {
-		slog.Error(`Could not decode image in change format handler. Error: ` + err.Error())
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(file)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var image image.Image
+	select {
+	case img := <-imageChan:
+		image = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	validImageBounds := utilities.CheckImageBounds(&image)
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
 	}
 
 	responseWriter := c.Response().BodyWriter()
 
 	if formatName == `png` {
+		c.Type(`image/png`)
 		err = imaging.Encode(responseWriter, image, imaging.PNG)
 	} else {
+		c.Type(`image/jpeg`)
+
 		err = imaging.Encode(responseWriter, image, imaging.JPEG, imaging.JPEGQuality(85))
 	}
-
 	if err != nil {
+		if ctx.Err() != nil {
+			slog.Error(`Encode failed due to context timeout. Error: ` + err.Error())
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+		}
+
 		slog.Error(`Could not encode image in change format handler. Error: ` + err.Error())
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
@@ -311,6 +505,9 @@ type FlipMetadata struct {
 }
 
 func Flip(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
 
 	metadata := c.FormValue(`metadata`)
 	if metadata == `` {
@@ -340,6 +537,12 @@ func Flip(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
+	mimeType := fileheader.Header.Get("Content-Type")
+
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
+	}
+
 	ext := strings.ToLower(filepath.Ext(fileheader.Filename))
 	if ext != `png` && ext != `jpeg` && ext != `jpg` {
 		return c.Status(400).JSON(fiber.Map{`message`: `Invalid file type.`})
@@ -352,82 +555,184 @@ func Flip(c *fiber.Ctx) error {
 	}
 	defer file.Close()
 
-	image, err := imaging.Decode(file)
-	if err != nil {
-		slog.Error(`Could not decode image in flip handler. Error: ` + err.Error())
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(file)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var image image.Image
+	select {
+	case img := <-imageChan:
+		image = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
 		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
 	}
 
+	validImageBounds := utilities.CheckImageBounds(&image)
+
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
 	responseWriter := c.Response().BodyWriter()
 
 	if direction == `horizontal` {
+
 		flippedImage := imaging.FlipH(image)
 
 		if ext == `png` {
+			c.Type(`image/png`)
+
 			err = imaging.Encode(responseWriter, flippedImage, imaging.PNG)
 		} else {
+			c.Type(`image/jpeg`)
+
 			err = imaging.Encode(responseWriter, flippedImage, imaging.JPEG, imaging.JPEGQuality(85))
 		}
-
 		if err != nil {
+			if ctx.Err() != nil {
+				slog.Error(`Encode failed due to context timeout. Error: ` + err.Error())
+				return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+			}
+
 			slog.Error(`Could not encode image in flip handler. Error: ` + err.Error())
+			return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 		}
 
 	} else if direction == `vertical` {
 		flippedImage := imaging.FlipV(image)
-
 		if ext == `png` {
+			c.Type(`image/png`)
+
 			err = imaging.Encode(responseWriter, flippedImage, imaging.PNG)
 		} else {
+			c.Type(`image/jpeg`)
+
 			err = imaging.Encode(responseWriter, flippedImage, imaging.JPEG, imaging.JPEGQuality(85))
 		}
 
 		if err != nil {
+			if ctx.Err() != nil {
+				slog.Error(`Encode failed due to context timeout. Error: ` + err.Error())
+				return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+			}
+
 			slog.Error(`Could not encode image in flip handler. Error: ` + err.Error())
+			return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 		}
+
 	}
 
 	return nil
 }
 
-func GrayScale(c *fiber.Ctx) error{
-	fileheader, err := c.FormFile(`image`);
+func GrayScale(c *fiber.Ctx) error {
+
+	ctx, cancelCtx := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelCtx()
+
+	fileheader, err := c.FormFile(`image`)
 	if err != nil {
 		slog.Error(`Could not get form file in gray scale handler. Error: ` + err.Error())
-		return c.Status(500).JSON(fiber.Map{`message`:`Something went wrong.`})
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
-	ext := strings.ToLower(filepath.Ext(fileheader.Filename));
+	mimeType := fileheader.Header.Get("Content-Type")
 
-	if ext != `png` && ext != `jpeg` && ext != `jpg`{
-		return c.Status(400).JSON(fiber.Map{`message`:`Invalid file format.`})
+	if mimeType != "image/jpeg" && mimeType != "image/png" {
+		return c.Status(fiber.StatusBadRequest).SendString("Unsupported file type: " + mimeType)
 	}
 
-	file, err := fileheader.Open();
+	ext := strings.ToLower(filepath.Ext(fileheader.Filename))
+
+	if ext != `png` && ext != `jpeg` && ext != `jpg` {
+		return c.Status(400).JSON(fiber.Map{`message`: `Invalid file format.`})
+	}
+
+	file, err := fileheader.Open()
 	if err != nil {
 		slog.Error(`Could not open file in gray scale handler. Error: ` + err.Error())
-		return c.Status(500).JSON(fiber.Map{`message`:`Something went wrong.`})
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
-	defer file.Close();
+	defer file.Close()
 
-	image, err := imaging.Decode(file);
+	var errChan = make(chan error)
+	var imageChan = make(chan image.Image)
+	go func() {
+		decodedImage, err := imaging.Decode(file)
+
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		imageChan <- decodedImage
+	}()
+
+	var image image.Image
+	select {
+	case img := <-imageChan:
+		image = img
+	case err := <-errChan:
+		slog.Error(`Could not decode image. Error: ` + err.Error())
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
+	case <-ctx.Done():
+		slog.Info(`Context canceled in rotate handler.`)
+		return c.Status(fiber.ErrRequestTimeout.Code).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	validImageBounds := utilities.CheckImageBounds(&image)
+
+	if !validImageBounds {
+		return c.Status(400).JSON(fiber.Map{`message`: `Image bound too big.`})
+	}
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+	grayImage := imaging.Grayscale(image)
+	responseWriter := c.Response().BodyWriter()
+
+	if ctx.Err() != nil {
+		return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+	}
+
+	if ext == `png` {
+		c.Type(`image/png`)
+		err = imaging.Encode(responseWriter, grayImage, imaging.PNG)
+	} else {
+		c.Type(`image/jpeg`)
+		err = imaging.Encode(responseWriter, grayImage, imaging.JPEG, imaging.JPEGQuality(85))
+	}
+
 	if err != nil {
-		slog.Error(`Could not decode image in gray scale handler. Error: ` + err.Error())
-		return c.Status(500).JSON(fiber.Map{`message`:`Something went wrong.`})
+		if ctx.Err() != nil {
+			slog.Error(`Encode failed due to context timeout. Error: ` + err.Error())
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{`message`: `Timeout.`})
+		}
+
+		slog.Error(`Could not encode image in gray  scale handler. Error: ` + err.Error())
+		return c.Status(500).JSON(fiber.Map{`message`: `Something went wrong.`})
 	}
 
-	grayImage := imaging.Grayscale(image);
-	responseWriter := c.Response().BodyWriter();
-
-	if ext == `png`{
-		err = imaging.Encode(responseWriter, grayImage, imaging.PNG);
-	}else{
-		err = imaging.Encode(responseWriter, grayImage, imaging.JPEG, imaging.JPEGQuality(85));
-	}
-	if err != nil {
-		slog.Error(`Could not encode image gray scale handler. Error: ` + err.Error())
-		return c.Status(500).JSON(fiber.Map{`message`:`Something went wrong.`});
-	}
-
-	return nil;
+	return nil
 }
